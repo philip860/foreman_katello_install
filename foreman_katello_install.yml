@@ -1,0 +1,153 @@
+---
+- name: Install and configure Foreman + Katello
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    foreman_release_rpm: "https://yum.theforeman.org/releases/latest/el9/x86_64/foreman-release.rpm"
+    katello_release_rpm: "https://yum.theforeman.org/katello/latest/katello/el9/x86_64/katello-repos-latest.rpm"
+
+    foreman_admin_user: "admin"
+    foreman_password_file: "/root/.foreman_admin_password"
+
+    effective_hostname: "{{ survey_hostname | default('') | trim }}"
+    effective_organization: "{{ survey_organization | default('') | trim }}"
+    effective_initial_location: "{{ (survey_initial_location | default('') | trim) | default('Lab', true) }}"
+
+  pre_tasks:
+    - name: Fail if organization was not provided
+      ansible.builtin.fail:
+        msg: "The survey variable 'survey_organization' is required."
+      when: effective_organization | length == 0
+
+    - name: Show resolved survey values
+      ansible.builtin.debug:
+        msg:
+          - "Hostname from survey: {{ effective_hostname if effective_hostname | length > 0 else 'not provided - current hostname will be kept' }}"
+          - "Organization: {{ effective_organization }}"
+          - "Initial location: {{ effective_initial_location }}"
+
+    - name: Check whether the Foreman admin password file already exists
+      ansible.builtin.stat:
+        path: "{{ foreman_password_file }}"
+      register: foreman_password_file_stat
+
+    - name: Read existing Foreman admin password
+      ansible.builtin.slurp:
+        path: "{{ foreman_password_file }}"
+      register: foreman_password_file_content
+      when: foreman_password_file_stat.stat.exists
+
+    - name: Set Foreman admin password from existing file
+      ansible.builtin.set_fact:
+        foreman_admin_password: "{{ foreman_password_file_content.content | b64decode | trim }}"
+      when: foreman_password_file_stat.stat.exists
+
+    - name: Generate a new random Foreman admin password
+      ansible.builtin.set_fact:
+        foreman_admin_password: >-
+          {{ lookup(
+               'ansible.builtin.password',
+               '/dev/null',
+               chars=['ascii_letters', 'digits'],
+               length=24
+             ) }}
+      when: not foreman_password_file_stat.stat.exists
+
+    - name: Save generated Foreman admin password to root-only file
+      ansible.builtin.copy:
+        dest: "{{ foreman_password_file }}"
+        content: "{{ foreman_admin_password }}\n"
+        owner: root
+        group: root
+        mode: "0600"
+      when: not foreman_password_file_stat.stat.exists
+
+  tasks:
+    - name: Update hostname if provided by survey
+      ansible.builtin.hostname:
+        name: "{{ effective_hostname }}"
+      when: effective_hostname | length > 0
+
+    - name: Refresh facts after hostname change
+      ansible.builtin.setup:
+      when: effective_hostname | length > 0
+
+    - name: Ensure base packages are installed
+      ansible.builtin.dnf:
+        name:
+          - firewalld
+          - curl
+          - wget
+          - vim
+        state: present
+
+    - name: Enable and start firewalld
+      ansible.builtin.service:
+        name: firewalld
+        state: started
+        enabled: true
+
+    - name: Install Foreman release RPM
+      ansible.builtin.dnf:
+        name: "{{ foreman_release_rpm }}"
+        state: present
+        disable_gpg_check: true
+
+    - name: Install Katello release RPM
+      ansible.builtin.dnf:
+        name: "{{ katello_release_rpm }}"
+        state: present
+        disable_gpg_check: true
+
+    - name: Install foreman-installer-katello package
+      ansible.builtin.dnf:
+        name: foreman-installer-katello
+        state: present
+
+    - name: Open required firewall services
+      ansible.posix.firewalld:
+        service: "{{ item }}"
+        permanent: true
+        state: enabled
+        immediate: true
+      loop:
+        - http
+        - https
+
+    - name: Open Katello subscription-manager port
+      ansible.posix.firewalld:
+        port: "5647/tcp"
+        permanent: true
+        state: enabled
+        immediate: true
+
+    - name: Run foreman-installer with Katello scenario
+      ansible.builtin.command:
+        argv:
+          - foreman-installer
+          - --scenario
+          - katello
+          - --foreman-initial-organization
+          - "{{ effective_organization }}"
+          - --foreman-initial-location
+          - "{{ effective_initial_location }}"
+          - --foreman-admin-password
+          - "{{ foreman_admin_password }}"
+      register: foreman_installer_result
+      changed_when: >
+        'Success!' in foreman_installer_result.stdout or
+        'Finished' in foreman_installer_result.stdout or
+        foreman_installer_result.rc == 0
+
+  post_tasks:
+    - name: Show Foreman install summary
+      ansible.builtin.debug:
+        msg:
+          - "Foreman + Katello installation completed."
+          - "URL: https://{{ ansible_facts['fqdn'] if (effective_hostname | length == 0) else effective_hostname }}"
+          - "Organization: {{ effective_organization }}"
+          - "Initial Location: {{ effective_initial_location }}"
+          - "Admin User: {{ foreman_admin_user }}"
+          - "Admin Password: {{ foreman_admin_password }}"
