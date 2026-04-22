@@ -15,7 +15,7 @@
 
     foreman_release_rpm_file: "/tmp/foreman-release.rpm"
     katello_release_rpm_file: "/tmp/katello-repos-latest.rpm"
-    puppet_release_rpm_file: "/tmp/puppet-release-el9.noarch.rpm"
+    puppet_release_rpm_file: "/tmp/puppet{{ puppet_major_version }}-release-el9.noarch.rpm"
 
     foreman_admin_user: "admin"
     foreman_password_file: "/root/.foreman_admin_password"
@@ -47,7 +47,10 @@
     effective_hostname: "{{ survey_hostname | default('') | trim }}"
     effective_organization: "{{ survey_organization | default('') | trim }}"
     effective_initial_location: "{{ survey_initial_location | default('') | trim | default('Lab', true) }}"
+
+    # Use survey hostname if provided; otherwise use current host fqdn
     foreman_server_fqdn: "{{ effective_hostname if (effective_hostname | length > 0) else ansible_facts['fqdn'] }}"
+    foreman_server_short: "{{ foreman_server_fqdn.split('.')[0] }}"
     foreman_server_ip: "{{ survey_foreman_server_ip | default(ansible_default_ipv4.address, true) }}"
 
     foreman_answers_file: "/etc/foreman-installer/scenarios.d/katello-answers.yaml"
@@ -134,9 +137,35 @@
     - name: Ensure local hosts entry exists for Foreman FQDN
       ansible.builtin.lineinfile:
         path: /etc/hosts
-        regexp: '.*\s{{ foreman_server_fqdn | regex_escape() }}(\s|$)'
-        line: "{{ foreman_server_ip }} {{ foreman_server_fqdn }}"
+        regexp: '^\s*{{ foreman_server_ip | regex_escape() }}\s+.*\b{{ foreman_server_fqdn | regex_escape() }}\b.*$'
+        line: "{{ foreman_server_ip }} {{ foreman_server_fqdn }} {{ foreman_server_short }}"
         state: present
+        create: true
+
+    - name: Ensure hostname command returns expected FQDN
+      ansible.builtin.command: hostname -f
+      register: hostname_fqdn_check
+      changed_when: false
+
+    - name: Fail if hostname -f does not match expected FQDN
+      ansible.builtin.fail:
+        msg: >-
+          hostname -f returned '{{ hostname_fqdn_check.stdout | trim }}'
+          but expected '{{ foreman_server_fqdn }}'.
+          Fix hostname resolution before continuing.
+      when: (hostname_fqdn_check.stdout | trim) != foreman_server_fqdn
+
+    - name: Ensure Foreman FQDN resolves locally
+      ansible.builtin.command: "getent hosts {{ foreman_server_fqdn }}"
+      register: foreman_fqdn_resolution
+      changed_when: false
+      failed_when: foreman_fqdn_resolution.rc != 0
+
+    - name: Ensure Foreman IP resolves via hosts lookup
+      ansible.builtin.command: "getent hosts {{ foreman_server_ip }}"
+      register: foreman_reverse_lookup
+      changed_when: false
+      failed_when: foreman_reverse_lookup.rc != 0
 
     - name: Ensure base packages are installed
       ansible.builtin.dnf:
@@ -232,7 +261,7 @@
     - name: Check whether Katello answers file already exists
       ansible.builtin.stat:
         path: "{{ foreman_answers_file }}"
-      register: foreman_katello_answers
+      register: foreman_katello_answers_before
 
     - name: Run foreman-installer with Katello scenario
       ansible.builtin.command:
@@ -267,8 +296,16 @@
           - --enable-tftp
           - --enable-tftp-proxy
       register: foreman_installer_result
-      when: not foreman_katello_answers.stat.exists
       changed_when: true
+
+    - name: Show foreman-installer stdout
+      ansible.builtin.debug:
+        var: foreman_installer_result.stdout_lines
+
+    - name: Show foreman-installer stderr
+      ansible.builtin.debug:
+        var: foreman_installer_result.stderr_lines
+      when: foreman_installer_result.stderr is defined and (foreman_installer_result.stderr | length > 0)
 
     - name: Re-check Katello answers file after installer run
       ansible.builtin.stat:
@@ -276,7 +313,7 @@
       register: foreman_katello_answers_after
 
     - name: Read installer log tail when Katello answers file is missing
-      ansible.builtin.shell: "tail -n 120 {{ foreman_installer_log }}"
+      ansible.builtin.shell: "tail -n 150 {{ foreman_installer_log }}"
       args:
         executable: /bin/bash
       register: foreman_installer_log_tail_missing_answers
@@ -288,7 +325,7 @@
       ansible.builtin.fail:
         msg: |-
           Katello installer did not create {{ foreman_answers_file }}.
-          This means the scenario was not fully configured, so the later API check will always fail.
+          The scenario was not fully configured.
 
           Last lines from {{ foreman_installer_log }}:
           {{ foreman_installer_log_tail_missing_answers.stdout | default('no installer log output found') }}
@@ -300,6 +337,10 @@
       changed_when: false
       failed_when: false
 
+    - name: Show Foreman managed services
+      ansible.builtin.debug:
+        var: foreman_service_list.stdout_lines
+
     - name: Check listeners on 80/443
       ansible.builtin.shell: |
         ss -ltnp | egrep ':(80|443)\s' || true
@@ -308,8 +349,12 @@
       register: foreman_listeners
       changed_when: false
 
+    - name: Show listeners on 80/443
+      ansible.builtin.debug:
+        var: foreman_listeners.stdout_lines
+
     - name: Read installer log tail when no listener is present
-      ansible.builtin.shell: "tail -n 120 {{ foreman_installer_log }}"
+      ansible.builtin.shell: "tail -n 150 {{ foreman_installer_log }}"
       args:
         executable: /bin/bash
       register: foreman_installer_log_tail_no_listener
@@ -355,7 +400,7 @@
         - (item.status | default(0)) == 200
 
     - name: Read installer log tail when API probe still fails
-      ansible.builtin.shell: "tail -n 120 {{ foreman_installer_log }}"
+      ansible.builtin.shell: "tail -n 150 {{ foreman_installer_log }}"
       args:
         executable: /bin/bash
       register: foreman_installer_log_tail_api_fail
