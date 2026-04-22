@@ -1,19 +1,30 @@
 ---
 - name: Install and configure Foreman + Katello
-  hosts: all
+  hosts: "{{ its_specific_host }}"
   become: true
   gather_facts: true
 
   vars:
-    foreman_release_rpm: "https://yum.theforeman.org/releases/latest/el9/x86_64/foreman-release.rpm"
-    katello_release_rpm: "https://yum.theforeman.org/katello/latest/katello/el9/x86_64/katello-repos-latest.rpm"
+    # ------------------------------------------------------------
+    # Pin versions instead of using "latest" for better stability
+    # Compatible documented example:
+    # Foreman 3.17 + Katello 4.19 on EL9
+    # ------------------------------------------------------------
+    foreman_version: "3.17"
+    katello_version: "4.19"
+
+    foreman_release_rpm_url: "https://yum.theforeman.org/releases/{{ foreman_version }}/el9/x86_64/foreman-release.rpm"
+    katello_release_rpm_url: "https://yum.theforeman.org/katello/{{ katello_version }}/katello/el9/x86_64/katello-repos-latest.rpm"
+
+    foreman_release_rpm_file: "/tmp/foreman-release.rpm"
+    katello_release_rpm_file: "/tmp/katello-repos-latest.rpm"
 
     foreman_admin_user: "admin"
     foreman_password_file: "/root/.foreman_admin_password"
 
     effective_hostname: "{{ survey_hostname | default('') | trim }}"
     effective_organization: "{{ survey_organization | default('') | trim }}"
-    effective_initial_location: "{{ (survey_initial_location | default('') | trim) | default('Lab', true) }}"
+    effective_initial_location: "{{ survey_initial_location | default('') | trim | default('Lab', true) }}"
 
   pre_tasks:
     - name: Fail if organization was not provided
@@ -21,12 +32,23 @@
         msg: "The survey variable 'survey_organization' is required."
       when: effective_organization | length == 0
 
+    - name: Fail if target system is not EL9
+      ansible.builtin.fail:
+        msg: >-
+          This playbook is pinned for EL9-based Foreman/Katello installation.
+          Detected distribution={{ ansible_distribution }} version={{ ansible_distribution_major_version }}.
+          Use an EL9 host for this Foreman/Katello install path.
+      when: ansible_distribution_major_version != "9"
+
     - name: Show resolved survey values
       ansible.builtin.debug:
         msg:
+          - "Target inventory host: {{ inventory_hostname }}"
           - "Hostname from survey: {{ effective_hostname if effective_hostname | length > 0 else 'not provided - current hostname will be kept' }}"
           - "Organization: {{ effective_organization }}"
           - "Initial location: {{ effective_initial_location }}"
+          - "Foreman version: {{ foreman_version }}"
+          - "Katello version: {{ katello_version }}"
 
     - name: Check whether the Foreman admin password file already exists
       ansible.builtin.stat:
@@ -89,22 +111,43 @@
         state: started
         enabled: true
 
-    - name: Install Foreman release RPM
+    - name: Download Foreman release RPM
+      ansible.builtin.get_url:
+        url: "{{ foreman_release_rpm_url }}"
+        dest: "{{ foreman_release_rpm_file }}"
+        mode: "0644"
+
+    - name: Download Katello release RPM
+      ansible.builtin.get_url:
+        url: "{{ katello_release_rpm_url }}"
+        dest: "{{ katello_release_rpm_file }}"
+        mode: "0644"
+
+    - name: Install Foreman release RPM from local file
       ansible.builtin.dnf:
-        name: "{{ foreman_release_rpm }}"
+        name: "{{ foreman_release_rpm_file }}"
         state: present
         disable_gpg_check: true
 
-    - name: Install Katello release RPM
+    - name: Install Katello release RPM from local file
       ansible.builtin.dnf:
-        name: "{{ katello_release_rpm }}"
+        name: "{{ katello_release_rpm_file }}"
         state: present
         disable_gpg_check: true
+
+    - name: Clean DNF metadata
+      ansible.builtin.command: dnf clean all
+      changed_when: true
+
+    - name: Rebuild DNF cache
+      ansible.builtin.command: dnf makecache
+      changed_when: true
 
     - name: Install foreman-installer-katello package
       ansible.builtin.dnf:
         name: foreman-installer-katello
         state: present
+        disable_gpg_check: true
 
     - name: Open required firewall services
       ansible.posix.firewalld:
@@ -123,6 +166,11 @@
         state: enabled
         immediate: true
 
+    - name: Check whether Foreman is already installed
+      ansible.builtin.stat:
+        path: /etc/foreman-installer/scenarios.d/katello-answers.yaml
+      register: foreman_katello_installed
+
     - name: Run foreman-installer with Katello scenario
       ansible.builtin.command:
         argv:
@@ -136,10 +184,8 @@
           - --foreman-admin-password
           - "{{ foreman_admin_password }}"
       register: foreman_installer_result
-      changed_when: >
-        'Success!' in foreman_installer_result.stdout or
-        'Finished' in foreman_installer_result.stdout or
-        foreman_installer_result.rc == 0
+      when: not foreman_katello_installed.stat.exists
+      changed_when: true
 
   post_tasks:
     - name: Show Foreman install summary
