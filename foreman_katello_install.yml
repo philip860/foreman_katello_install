@@ -21,10 +21,46 @@
 
     foreman_admin_user: "admin"
     foreman_password_file: "/root/.foreman_admin_password"
+    foreman_hammer_config_dir: "/root/.hammer"
+    foreman_hammer_config_file: "/root/.hammer/cli_config.yml"
+
+    # ------------------------------------------------------------
+    # Management network (existing home network)
+    # Foreman itself is managed here
+    # ------------------------------------------------------------
+    foreman_management_network_cidr: "10.0.0.0/24"
+
+    # ------------------------------------------------------------
+    # Provisioning network (isolated VMware PXE/Kickstart network)
+    # New systems boot here first, then can later move to 10.0.0.0/24
+    # ------------------------------------------------------------
+    foreman_provisioning_network_name: "vmware-provisioning"
+    foreman_provisioning_network: "192.168.100.0"
+    foreman_provisioning_netmask: "255.255.255.0"
+    foreman_provisioning_network_cidr: "192.168.100.0/24"
+    foreman_provisioning_ip: "192.168.100.10"
+    foreman_dhcp_range_from: "192.168.100.100"
+    foreman_dhcp_range_to: "192.168.100.200"
+    foreman_dhcp_range: "{{ foreman_dhcp_range_from }} {{ foreman_dhcp_range_to }}"
+    foreman_dhcp_gateway: "192.168.100.1"
+
+    # Foreman will provide DNS for the provisioning network
+    foreman_dns_zone: "duncan-networks.com"
+    foreman_reverse_zone: "100.168.192.in-addr.arpa"
+
+    # Upstream resolvers used by Foreman/BIND
+    foreman_dns_forwarders:
+      - "1.1.1.1"
+      - "8.8.8.8"
+
+    # DHCP clients on provisioning network will use Foreman as DNS
+    foreman_dhcp_nameservers:
+      - "{{ foreman_provisioning_ip }}"
 
     effective_hostname: "{{ survey_hostname | default('') | trim }}"
     effective_organization: "{{ survey_organization | default('') | trim }}"
     effective_initial_location: "{{ survey_initial_location | default('') | trim | default('Lab', true) }}"
+    foreman_server_fqdn: "{{ effective_hostname if (effective_hostname | length > 0) else ansible_facts['fqdn'] }}"
 
   pre_tasks:
     - name: Fail if organization was not provided
@@ -35,20 +71,9 @@
     - name: Fail if target system is not EL9
       ansible.builtin.fail:
         msg: >-
-          This playbook is pinned for EL9-based Foreman/Katello installation.
-          Detected distribution={{ ansible_distribution }} version={{ ansible_distribution_major_version }}.
-          Use an EL9 host for this Foreman/Katello install path.
+          This playbook requires EL9 for Foreman/Katello.
+          Detected {{ ansible_distribution }} {{ ansible_distribution_major_version }}.
       when: ansible_distribution_major_version != "9"
-
-    - name: Show resolved survey values
-      ansible.builtin.debug:
-        msg:
-          - "Target inventory host: {{ inventory_hostname }}"
-          - "Hostname from survey: {{ effective_hostname if effective_hostname | length > 0 else 'not provided - current hostname will be kept' }}"
-          - "Organization: {{ effective_organization }}"
-          - "Initial location: {{ effective_initial_location }}"
-          - "Foreman version: {{ foreman_version }}"
-          - "Katello version: {{ katello_version }}"
 
     - name: Check whether the Foreman admin password file already exists
       ansible.builtin.stat:
@@ -86,6 +111,22 @@
         mode: "0600"
       when: not foreman_password_file_stat.stat.exists
 
+    - name: Show resolved values
+      ansible.builtin.debug:
+        msg:
+          - "Target inventory host: {{ inventory_hostname }}"
+          - "Hostname from survey: {{ effective_hostname if effective_hostname | length > 0 else 'not provided - current hostname will be kept' }}"
+          - "Organization: {{ effective_organization }}"
+          - "Initial location: {{ effective_initial_location }}"
+          - "Management network: {{ foreman_management_network_cidr }}"
+          - "Provisioning network: {{ foreman_provisioning_network_cidr }}"
+          - "Provisioning IP on Foreman: {{ foreman_provisioning_ip }}"
+          - "Provisioning DHCP range: {{ foreman_dhcp_range }}"
+          - "Provisioning gateway: {{ foreman_dhcp_gateway }}"
+          - "DNS zone: {{ foreman_dns_zone }}"
+          - "Reverse zone: {{ foreman_reverse_zone }}"
+          - "DNS clients will use: {{ foreman_dhcp_nameservers | join(', ') }}"
+
   tasks:
     - name: Update hostname if provided by survey
       ansible.builtin.hostname:
@@ -103,6 +144,11 @@
           - curl
           - wget
           - vim
+          - bind
+          - bind-utils
+          - dhcp-server
+          - tftp-server
+          - syslinux
         state: present
 
     - name: Enable and start firewalld
@@ -149,29 +195,27 @@
         state: present
         disable_gpg_check: true
 
-    - name: Open required firewall services
+    - name: Open required firewall ports
       ansible.posix.firewalld:
-        service: "{{ item }}"
+        port: "{{ item }}"
         permanent: true
         state: enabled
         immediate: true
       loop:
-        - http
-        - https
-
-    - name: Open Katello subscription-manager port
-      ansible.posix.firewalld:
-        port: "5647/tcp"
-        permanent: true
-        state: enabled
-        immediate: true
+        - 80/tcp
+        - 443/tcp
+        - 53/tcp
+        - 53/udp
+        - 67/udp
+        - 69/udp
+        - 5647/tcp
 
     - name: Check whether Foreman is already installed
       ansible.builtin.stat:
         path: /etc/foreman-installer/scenarios.d/katello-answers.yaml
       register: foreman_katello_installed
 
-    - name: Run foreman-installer with Katello scenario
+    - name: Run foreman-installer with Katello scenario and isolated provisioning services
       ansible.builtin.command:
         argv:
           - foreman-installer
@@ -183,17 +227,166 @@
           - "{{ effective_initial_location }}"
           - --foreman-admin-password
           - "{{ foreman_admin_password }}"
+          - --enable-dns
+          - --enable-dns-proxy
+          - --dns-zone
+          - "{{ foreman_dns_zone }}"
+          - --dns-reverse
+          - "{{ foreman_reverse_zone }}"
+          - --dns-forwarders
+          - "{{ foreman_dns_forwarders | join(',') }}"
+          - --enable-dhcp
+          - --enable-dhcp-proxy
+          - --dhcp-range
+          - "{{ foreman_dhcp_range }}"
+          - --dhcp-gateway
+          - "{{ foreman_dhcp_gateway }}"
+          - --dhcp-nameservers
+          - "{{ foreman_dhcp_nameservers | join(',') }}"
+          - --enable-tftp
+          - --enable-tftp-proxy
       register: foreman_installer_result
       when: not foreman_katello_installed.stat.exists
       changed_when: true
+
+    - name: Ensure Hammer config directory exists
+      ansible.builtin.file:
+        path: "{{ foreman_hammer_config_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Configure Hammer CLI authentication
+      ansible.builtin.copy:
+        dest: "{{ foreman_hammer_config_file }}"
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          :foreman:
+            :host: "https://{{ foreman_server_fqdn }}"
+            :username: "{{ foreman_admin_user }}"
+            :password: "{{ foreman_admin_password }}"
+          :ui:
+            :interactive: false
+          :watch_plain: true
+
+    - name: Wait for Foreman API to respond
+      ansible.builtin.uri:
+        url: "https://{{ foreman_server_fqdn }}/api/status"
+        method: GET
+        user: "{{ foreman_admin_user }}"
+        password: "{{ foreman_admin_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: 200
+      register: foreman_api_status
+      retries: 20
+      delay: 15
+      until: foreman_api_status.status == 200
+
+    - name: Check whether provisioning domain exists
+      ansible.builtin.command:
+        argv:
+          - hammer
+          - domain
+          - info
+          - --name
+          - "{{ foreman_dns_zone }}"
+      register: foreman_domain_info
+      failed_when: false
+      changed_when: false
+
+    - name: Create provisioning domain in Foreman
+      ansible.builtin.command:
+        argv:
+          - hammer
+          - domain
+          - create
+          - --name
+          - "{{ foreman_dns_zone }}"
+          - --organizations
+          - "{{ effective_organization }}"
+          - --locations
+          - "{{ effective_initial_location }}"
+      when: foreman_domain_info.rc != 0
+
+    - name: Discover integrated Smart Proxy ID
+      ansible.builtin.shell: |
+        set -o pipefail
+        hammer --csv proxy list | awk -F, -v name="{{ foreman_server_fqdn }}" '$2 == name {print $1}'
+      args:
+        executable: /bin/bash
+      register: foreman_proxy_id
+      changed_when: false
+      failed_when: foreman_proxy_id.stdout | trim == ""
+
+    - name: Check whether provisioning subnet exists
+      ansible.builtin.command:
+        argv:
+          - hammer
+          - subnet
+          - info
+          - --name
+          - "{{ foreman_provisioning_network_name }}"
+      register: foreman_subnet_info
+      failed_when: false
+      changed_when: false
+
+    - name: Create provisioning subnet in Foreman
+      ansible.builtin.command:
+        argv:
+          - hammer
+          - subnet
+          - create
+          - --name
+          - "{{ foreman_provisioning_network_name }}"
+          - --network
+          - "{{ foreman_provisioning_network }}"
+          - --mask
+          - "{{ foreman_provisioning_netmask }}"
+          - --gateway
+          - "{{ foreman_dhcp_gateway }}"
+          - --dns-primary
+          - "{{ foreman_provisioning_ip }}"
+          - --dns-secondary
+          - "{{ foreman_dns_forwarders[0] }}"
+          - --from
+          - "{{ foreman_dhcp_range_from }}"
+          - --to
+          - "{{ foreman_dhcp_range_to }}"
+          - --ipam
+          - DHCP
+          - --boot-mode
+          - DHCP
+          - --organizations
+          - "{{ effective_organization }}"
+          - --locations
+          - "{{ effective_initial_location }}"
+          - --domains
+          - "{{ foreman_dns_zone }}"
+          - --dhcp-id
+          - "{{ foreman_proxy_id.stdout | trim }}"
+          - --dns-id
+          - "{{ foreman_proxy_id.stdout | trim }}"
+          - --tftp-id
+          - "{{ foreman_proxy_id.stdout | trim }}"
+      when: foreman_subnet_info.rc != 0
 
   post_tasks:
     - name: Show Foreman install summary
       ansible.builtin.debug:
         msg:
           - "Foreman + Katello installation completed."
-          - "URL: https://{{ ansible_facts['fqdn'] if (effective_hostname | length == 0) else effective_hostname }}"
+          - "URL: https://{{ foreman_server_fqdn }}"
           - "Organization: {{ effective_organization }}"
           - "Initial Location: {{ effective_initial_location }}"
+          - "Management network: {{ foreman_management_network_cidr }}"
+          - "Provisioning network: {{ foreman_provisioning_network_cidr }}"
+          - "Provisioning subnet name in Foreman: {{ foreman_provisioning_network_name }}"
+          - "Provisioning gateway: {{ foreman_dhcp_gateway }}"
+          - "DNS zone in Foreman: {{ foreman_dns_zone }}"
+          - "Reverse zone: {{ foreman_reverse_zone }}"
           - "Admin User: {{ foreman_admin_user }}"
           - "Admin Password: {{ foreman_admin_password }}"
