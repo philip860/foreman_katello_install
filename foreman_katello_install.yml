@@ -5,11 +5,6 @@
   gather_facts: true
 
   vars:
-    # ------------------------------------------------------------
-    # Pin versions instead of using "latest" for better stability
-    # Compatible documented example:
-    # Foreman 3.17 + Katello 4.19 on EL9
-    # ------------------------------------------------------------
     foreman_version: "3.17"
     katello_version: "4.19"
 
@@ -24,16 +19,8 @@
     foreman_hammer_config_dir: "/root/.hammer"
     foreman_hammer_config_file: "/root/.hammer/cli_config.yml"
 
-    # ------------------------------------------------------------
-    # Management network (existing home network)
-    # Foreman itself is managed here
-    # ------------------------------------------------------------
     foreman_management_network_cidr: "10.0.0.0/24"
 
-    # ------------------------------------------------------------
-    # Provisioning network (isolated VMware PXE/Kickstart network)
-    # New systems boot here first, then can later move to 10.0.0.0/24
-    # ------------------------------------------------------------
     foreman_provisioning_network_name: "vmware-provisioning"
     foreman_provisioning_network: "192.168.100.0"
     foreman_provisioning_netmask: "255.255.255.0"
@@ -44,16 +31,13 @@
     foreman_dhcp_range: "{{ foreman_dhcp_range_from }} {{ foreman_dhcp_range_to }}"
     foreman_dhcp_gateway: "192.168.100.1"
 
-    # Foreman will provide DNS for the provisioning network
     foreman_dns_zone: "duncan-networks.com"
     foreman_reverse_zone: "100.168.192.in-addr.arpa"
 
-    # Upstream resolvers used by Foreman/BIND
     foreman_dns_forwarders:
       - "1.1.1.1"
       - "8.8.8.8"
 
-    # DHCP clients on provisioning network will use Foreman as DNS
     foreman_dhcp_nameservers:
       - "{{ foreman_provisioning_ip }}"
 
@@ -74,6 +58,20 @@
           This playbook requires EL9 for Foreman/Katello.
           Detected {{ ansible_distribution }} {{ ansible_distribution_major_version }}.
       when: ansible_distribution_major_version != "9"
+
+    - name: Check enabled repositories
+      ansible.builtin.command: dnf repolist --enabled
+      register: enabled_repos
+      changed_when: false
+
+    - name: Fail if BaseOS/AppStream repos are not available
+      ansible.builtin.fail:
+        msg: >-
+          This host does not have the required EL9 content repositories enabled.
+          Foreman/Katello provisioning dependencies require RHEL BaseOS and AppStream.
+      when:
+        - "'baseos' not in enabled_repos.stdout | lower"
+        - "'appstream' not in enabled_repos.stdout | lower"
 
     - name: Check whether the Foreman admin password file already exists
       ansible.builtin.stat:
@@ -111,22 +109,6 @@
         mode: "0600"
       when: not foreman_password_file_stat.stat.exists
 
-    - name: Show resolved values
-      ansible.builtin.debug:
-        msg:
-          - "Target inventory host: {{ inventory_hostname }}"
-          - "Hostname from survey: {{ effective_hostname if effective_hostname | length > 0 else 'not provided - current hostname will be kept' }}"
-          - "Organization: {{ effective_organization }}"
-          - "Initial location: {{ effective_initial_location }}"
-          - "Management network: {{ foreman_management_network_cidr }}"
-          - "Provisioning network: {{ foreman_provisioning_network_cidr }}"
-          - "Provisioning IP on Foreman: {{ foreman_provisioning_ip }}"
-          - "Provisioning DHCP range: {{ foreman_dhcp_range }}"
-          - "Provisioning gateway: {{ foreman_dhcp_gateway }}"
-          - "DNS zone: {{ foreman_dns_zone }}"
-          - "Reverse zone: {{ foreman_reverse_zone }}"
-          - "DNS clients will use: {{ foreman_dhcp_nameservers | join(', ') }}"
-
   tasks:
     - name: Update hostname if provided by survey
       ansible.builtin.hostname:
@@ -144,11 +126,11 @@
           - curl
           - wget
           - vim
-          - bind
-          - bind-utils
+          - bind9.18
+          - bind9.18-utils
           - dhcp-server
           - tftp-server
-          - syslinux
+          - syslinux-tftpboot
         state: present
 
     - name: Enable and start firewalld
