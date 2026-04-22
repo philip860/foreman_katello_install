@@ -49,6 +49,15 @@
     effective_initial_location: "{{ survey_initial_location | default('') | trim | default('Lab', true) }}"
     foreman_server_fqdn: "{{ effective_hostname if (effective_hostname | length > 0) else ansible_facts['fqdn'] }}"
 
+    # Optional survey variable if DNS is not available in your home lab
+    foreman_server_ip: "{{ survey_foreman_server_ip | default(ansible_default_ipv4.address, true) }}"
+
+    # Preferred API targets in order
+    foreman_api_candidates:
+      - "{{ foreman_server_fqdn }}"
+      - "{{ foreman_server_ip }}"
+      - "127.0.0.1"
+
   pre_tasks:
     - name: Fail if organization was not provided
       ansible.builtin.fail:
@@ -121,6 +130,18 @@
     - name: Refresh facts after hostname change
       ansible.builtin.setup:
       when: effective_hostname | length > 0
+
+    - name: Ensure local hosts entry exists for Foreman FQDN when DNS is unavailable
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        regexp: '.*\s{{ foreman_server_fqdn | regex_escape() }}(\s|$)'
+        line: "{{ foreman_server_ip }} {{ foreman_server_fqdn }}"
+        state: present
+      when:
+        - foreman_server_ip is defined
+        - foreman_server_ip | length > 0
+        - foreman_server_fqdn is defined
+        - foreman_server_fqdn | length > 0
 
     - name: Ensure base packages are installed
       ansible.builtin.dnf:
@@ -254,6 +275,77 @@
       when: not foreman_katello_installed.stat.exists
       changed_when: true
 
+    - name: Show foreman-installer output when installer ran
+      ansible.builtin.debug:
+        var: foreman_installer_result.stdout_lines
+      when:
+        - not foreman_katello_installed.stat.exists
+        - foreman_installer_result is defined
+
+    - name: Check Foreman managed services
+      ansible.builtin.command: foreman-maintain service list
+      register: foreman_service_list
+      changed_when: false
+      failed_when: false
+
+    - name: Show Foreman managed services
+      ansible.builtin.debug:
+        var: foreman_service_list.stdout_lines
+
+    - name: Check listeners on 80/443
+      ansible.builtin.shell: |
+        ss -ltnp | egrep ':(80|443)\s'
+      args:
+        executable: /bin/bash
+      register: foreman_listeners
+      changed_when: false
+      failed_when: false
+
+    - name: Show listeners on 80/443
+      ansible.builtin.debug:
+        var: foreman_listeners.stdout_lines
+
+    - name: Check whether Foreman API responds via candidate endpoints
+      ansible.builtin.uri:
+        url: "https://{{ item }}/api/status"
+        method: GET
+        user: "{{ foreman_admin_user }}"
+        password: "{{ foreman_admin_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: 200
+        timeout: 20
+      loop: "{{ foreman_api_candidates | unique }}"
+      register: foreman_api_probe
+      ignore_errors: true
+      changed_when: false
+
+    - name: Select first working Foreman API endpoint
+      ansible.builtin.set_fact:
+        foreman_api_host: "{{ item.item }}"
+      loop: "{{ foreman_api_probe.results }}"
+      when:
+        - foreman_api_host is not defined
+        - not (item.failed | default(false))
+        - (item.status | default(0)) == 200
+
+    - name: Fail if no Foreman API endpoint responded
+      ansible.builtin.fail:
+        msg: |-
+          Foreman API did not respond on any tested endpoint: {{ foreman_api_candidates | unique | join(', ') }}
+
+          foreman-maintain service list:
+          {{ foreman_service_list.stdout | default('no output') }}
+
+          ss listeners:
+          {{ foreman_listeners.stdout | default('no output') }}
+
+          Hint:
+          - If DNS is unavailable, pass survey_foreman_server_ip.
+          - If nothing is listening on 443, inspect installer logs:
+            /var/log/foreman-installer/katello.log
+      when: foreman_api_host is not defined
+
     - name: Ensure Hammer config directory exists
       ansible.builtin.file:
         path: "{{ foreman_hammer_config_dir }}"
@@ -270,26 +362,12 @@
         mode: "0600"
         content: |
           :foreman:
-            :host: "https://{{ foreman_server_fqdn }}"
+            :host: "https://{{ foreman_api_host }}"
             :username: "{{ foreman_admin_user }}"
             :password: "{{ foreman_admin_password }}"
           :ui:
             :interactive: false
           :watch_plain: true
-
-    - name: Wait for Foreman API to respond
-      ansible.builtin.uri:
-        url: "https://{{ foreman_server_fqdn }}/api/status"
-        method: GET
-        user: "{{ foreman_admin_user }}"
-        password: "{{ foreman_admin_password }}"
-        force_basic_auth: true
-        validate_certs: false
-        status_code: 200
-      register: foreman_api_status
-      retries: 20
-      delay: 15
-      until: foreman_api_status.status == 200
 
     - name: Check whether provisioning domain exists
       ansible.builtin.command:
@@ -325,7 +403,32 @@
         executable: /bin/bash
       register: foreman_proxy_id
       changed_when: false
-      failed_when: foreman_proxy_id.stdout | trim == ""
+      failed_when: false
+
+    - name: Fallback proxy lookup by API host
+      ansible.builtin.shell: |
+        set -o pipefail
+        hammer --csv proxy list | awk -F, -v name="{{ foreman_api_host }}" '$2 == name {print $1}'
+      args:
+        executable: /bin/bash
+      register: foreman_proxy_id_fallback
+      changed_when: false
+      failed_when: false
+      when: foreman_proxy_id.stdout | default('') | trim == ""
+
+    - name: Set final Smart Proxy ID
+      ansible.builtin.set_fact:
+        foreman_proxy_id_final: >-
+          {{
+            (foreman_proxy_id.stdout | default('') | trim)
+            if (foreman_proxy_id.stdout | default('') | trim | length > 0)
+            else (foreman_proxy_id_fallback.stdout | default('') | trim)
+          }}
+
+    - name: Fail if Smart Proxy ID could not be determined
+      ansible.builtin.fail:
+        msg: "Could not determine integrated Smart Proxy ID from hammer proxy list."
+      when: foreman_proxy_id_final | length == 0
 
     - name: Check whether provisioning subnet exists
       ansible.builtin.command:
@@ -372,11 +475,11 @@
           - --domains
           - "{{ foreman_dns_zone }}"
           - --dhcp-id
-          - "{{ foreman_proxy_id.stdout | trim }}"
+          - "{{ foreman_proxy_id_final }}"
           - --dns-id
-          - "{{ foreman_proxy_id.stdout | trim }}"
+          - "{{ foreman_proxy_id_final }}"
           - --tftp-id
-          - "{{ foreman_proxy_id.stdout | trim }}"
+          - "{{ foreman_proxy_id_final }}"
       when: foreman_subnet_info.rc != 0
 
   post_tasks:
@@ -384,7 +487,8 @@
       ansible.builtin.debug:
         msg:
           - "Foreman + Katello installation completed."
-          - "URL: https://{{ foreman_server_fqdn }}"
+          - "Primary URL/FQDN: https://{{ foreman_server_fqdn }}"
+          - "Working API endpoint: https://{{ foreman_api_host }}"
           - "Organization: {{ effective_organization }}"
           - "Initial Location: {{ effective_initial_location }}"
           - "Management network: {{ foreman_management_network_cidr }}"
