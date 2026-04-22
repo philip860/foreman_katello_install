@@ -48,11 +48,11 @@
     effective_organization: "{{ survey_organization | default('') | trim }}"
     effective_initial_location: "{{ survey_initial_location | default('') | trim | default('Lab', true) }}"
     foreman_server_fqdn: "{{ effective_hostname if (effective_hostname | length > 0) else ansible_facts['fqdn'] }}"
-
-    # Optional survey variable if DNS is not available in your home lab
     foreman_server_ip: "{{ survey_foreman_server_ip | default(ansible_default_ipv4.address, true) }}"
 
-    # Preferred API targets in order
+    foreman_answers_file: "/etc/foreman-installer/scenarios.d/katello-answers.yaml"
+    foreman_installer_log: "/var/log/foreman-installer/katello.log"
+
     foreman_api_candidates:
       - "{{ foreman_server_fqdn }}"
       - "{{ foreman_server_ip }}"
@@ -131,17 +131,12 @@
       ansible.builtin.setup:
       when: effective_hostname | length > 0
 
-    - name: Ensure local hosts entry exists for Foreman FQDN when DNS is unavailable
+    - name: Ensure local hosts entry exists for Foreman FQDN
       ansible.builtin.lineinfile:
         path: /etc/hosts
         regexp: '.*\s{{ foreman_server_fqdn | regex_escape() }}(\s|$)'
         line: "{{ foreman_server_ip }} {{ foreman_server_fqdn }}"
         state: present
-      when:
-        - foreman_server_ip is defined
-        - foreman_server_ip | length > 0
-        - foreman_server_fqdn is defined
-        - foreman_server_fqdn | length > 0
 
     - name: Ensure base packages are installed
       ansible.builtin.dnf:
@@ -234,12 +229,12 @@
         - 69/udp
         - 5647/tcp
 
-    - name: Check whether Foreman is already installed
+    - name: Check whether Katello answers file already exists
       ansible.builtin.stat:
-        path: /etc/foreman-installer/scenarios.d/katello-answers.yaml
-      register: foreman_katello_installed
+        path: "{{ foreman_answers_file }}"
+      register: foreman_katello_answers
 
-    - name: Run foreman-installer with Katello scenario and isolated provisioning services
+    - name: Run foreman-installer with Katello scenario
       ansible.builtin.command:
         argv:
           - foreman-installer
@@ -272,15 +267,32 @@
           - --enable-tftp
           - --enable-tftp-proxy
       register: foreman_installer_result
-      when: not foreman_katello_installed.stat.exists
+      when: not foreman_katello_answers.stat.exists
       changed_when: true
 
-    - name: Show foreman-installer output when installer ran
-      ansible.builtin.debug:
-        var: foreman_installer_result.stdout_lines
-      when:
-        - not foreman_katello_installed.stat.exists
-        - foreman_installer_result is defined
+    - name: Re-check Katello answers file after installer run
+      ansible.builtin.stat:
+        path: "{{ foreman_answers_file }}"
+      register: foreman_katello_answers_after
+
+    - name: Read installer log tail when Katello answers file is missing
+      ansible.builtin.shell: "tail -n 120 {{ foreman_installer_log }}"
+      args:
+        executable: /bin/bash
+      register: foreman_installer_log_tail_missing_answers
+      changed_when: false
+      failed_when: false
+      when: not foreman_katello_answers_after.stat.exists
+
+    - name: Fail if Katello scenario was not configured
+      ansible.builtin.fail:
+        msg: |-
+          Katello installer did not create {{ foreman_answers_file }}.
+          This means the scenario was not fully configured, so the later API check will always fail.
+
+          Last lines from {{ foreman_installer_log }}:
+          {{ foreman_installer_log_tail_missing_answers.stdout | default('no installer log output found') }}
+      when: not foreman_katello_answers_after.stat.exists
 
     - name: Check Foreman managed services
       ansible.builtin.command: foreman-maintain service list
@@ -288,24 +300,37 @@
       changed_when: false
       failed_when: false
 
-    - name: Show Foreman managed services
-      ansible.builtin.debug:
-        var: foreman_service_list.stdout_lines
-
     - name: Check listeners on 80/443
       ansible.builtin.shell: |
-        ss -ltnp | egrep ':(80|443)\s'
+        ss -ltnp | egrep ':(80|443)\s' || true
       args:
         executable: /bin/bash
       register: foreman_listeners
       changed_when: false
+
+    - name: Read installer log tail when no listener is present
+      ansible.builtin.shell: "tail -n 120 {{ foreman_installer_log }}"
+      args:
+        executable: /bin/bash
+      register: foreman_installer_log_tail_no_listener
+      changed_when: false
       failed_when: false
+      when: foreman_listeners.stdout | trim == ""
 
-    - name: Show listeners on 80/443
-      ansible.builtin.debug:
-        var: foreman_listeners.stdout_lines
+    - name: Fail if Katello installed no web listener
+      ansible.builtin.fail:
+        msg: |-
+          Katello answers file exists, but nothing is listening on 80/443.
+          This is not just a DNS problem.
 
-    - name: Check whether Foreman API responds via candidate endpoints
+          foreman-maintain service list:
+          {{ foreman_service_list.stdout | default('no output') }}
+
+          Last lines from {{ foreman_installer_log }}:
+          {{ foreman_installer_log_tail_no_listener.stdout | default('no installer log output found') }}
+      when: foreman_listeners.stdout | trim == ""
+
+    - name: Probe Foreman API via candidate endpoints
       ansible.builtin.uri:
         url: "https://{{ item }}/api/status"
         method: GET
@@ -329,6 +354,15 @@
         - not (item.failed | default(false))
         - (item.status | default(0)) == 200
 
+    - name: Read installer log tail when API probe still fails
+      ansible.builtin.shell: "tail -n 120 {{ foreman_installer_log }}"
+      args:
+        executable: /bin/bash
+      register: foreman_installer_log_tail_api_fail
+      changed_when: false
+      failed_when: false
+      when: foreman_api_host is not defined
+
     - name: Fail if no Foreman API endpoint responded
       ansible.builtin.fail:
         msg: |-
@@ -340,10 +374,8 @@
           ss listeners:
           {{ foreman_listeners.stdout | default('no output') }}
 
-          Hint:
-          - If DNS is unavailable, pass survey_foreman_server_ip.
-          - If nothing is listening on 443, inspect installer logs:
-            /var/log/foreman-installer/katello.log
+          Last lines from {{ foreman_installer_log }}:
+          {{ foreman_installer_log_tail_api_fail.stdout | default('no installer log output found') }}
       when: foreman_api_host is not defined
 
     - name: Ensure Hammer config directory exists
@@ -395,7 +427,7 @@
           - "{{ effective_initial_location }}"
       when: foreman_domain_info.rc != 0
 
-    - name: Discover integrated Smart Proxy ID
+    - name: Discover integrated Smart Proxy ID by FQDN
       ansible.builtin.shell: |
         set -o pipefail
         hammer --csv proxy list | awk -F, -v name="{{ foreman_server_fqdn }}" '$2 == name {print $1}'
@@ -405,7 +437,7 @@
       changed_when: false
       failed_when: false
 
-    - name: Fallback proxy lookup by API host
+    - name: Fallback proxy lookup by active API host
       ansible.builtin.shell: |
         set -o pipefail
         hammer --csv proxy list | awk -F, -v name="{{ foreman_api_host }}" '$2 == name {print $1}'
