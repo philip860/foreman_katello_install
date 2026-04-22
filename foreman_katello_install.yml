@@ -31,7 +31,6 @@
     foreman_provisioning_ip: "192.168.100.10"
     foreman_dhcp_range_from: "192.168.100.100"
     foreman_dhcp_range_to: "192.168.100.200"
-    foreman_dhcp_range: "{{ foreman_dhcp_range_from }} {{ foreman_dhcp_range_to }}"
     foreman_dhcp_gateway: "192.168.100.1"
 
     foreman_dns_zone: "duncan-networks.com"
@@ -41,14 +40,10 @@
       - "1.1.1.1"
       - "8.8.8.8"
 
-    foreman_dhcp_nameservers:
-      - "{{ foreman_provisioning_ip }}"
-
     effective_hostname: "{{ survey_hostname | default('') | trim }}"
     effective_organization: "{{ survey_organization | default('') | trim }}"
     effective_initial_location: "{{ survey_initial_location | default('') | trim | default('Lab', true) }}"
 
-    # Use survey hostname if provided; otherwise use current host fqdn
     foreman_server_fqdn: "{{ effective_hostname if (effective_hostname | length > 0) else ansible_facts['fqdn'] }}"
     foreman_server_short: "{{ foreman_server_fqdn.split('.')[0] }}"
     foreman_server_ip: "{{ survey_foreman_server_ip | default(ansible_default_ipv4.address, true) }}"
@@ -137,7 +132,7 @@
     - name: Ensure local hosts entry exists for Foreman FQDN
       ansible.builtin.lineinfile:
         path: /etc/hosts
-        regexp: '^\s*{{ foreman_server_ip | regex_escape() }}\s+.*\b{{ foreman_server_fqdn | regex_escape() }}\b.*$'
+        regexp: '.*\s{{ foreman_server_fqdn | regex_escape() }}(\s|$)'
         line: "{{ foreman_server_ip }} {{ foreman_server_fqdn }} {{ foreman_server_short }}"
         state: present
         create: true
@@ -258,11 +253,6 @@
         - 69/udp
         - 5647/tcp
 
-    - name: Check whether Katello answers file already exists
-      ansible.builtin.stat:
-        path: "{{ foreman_answers_file }}"
-      register: foreman_katello_answers_before
-
     - name: Run foreman-installer with Katello scenario
       ansible.builtin.command:
         argv:
@@ -277,24 +267,23 @@
           - "{{ foreman_admin_user }}"
           - --foreman-initial-admin-password
           - "{{ foreman_admin_password }}"
-          - --enable-dns
-          - --enable-dns-proxy
-          - --dns-zone
-          - "{{ foreman_dns_zone }}"
-          - --dns-reverse
-          - "{{ foreman_reverse_zone }}"
-          - --dns-forwarders
-          - "{{ foreman_dns_forwarders | join(',') }}"
-          - --enable-dhcp
-          - --enable-dhcp-proxy
-          - --dhcp-range
-          - "{{ foreman_dhcp_range }}"
-          - --dhcp-gateway
-          - "{{ foreman_dhcp_gateway }}"
-          - --dhcp-nameservers
-          - "{{ foreman_dhcp_nameservers | join(',') }}"
-          - --enable-tftp
-          - --enable-tftp-proxy
+          - --foreman-proxy-dns
+          - "true"
+          - --foreman-proxy-dns-provider
+          - "nsupdate"
+          - --foreman-proxy-dns-managed
+          - "true"
+          - --reset-foreman-proxy-dns-server
+          - --foreman-proxy-dhcp
+          - "true"
+          - --foreman-proxy-dhcp-provider
+          - "isc"
+          - --foreman-proxy-dhcp-managed
+          - "true"
+          - --foreman-proxy-tftp
+          - "true"
+          - --foreman-proxy-tftp-managed
+          - "true"
       register: foreman_installer_result
       changed_when: true
 
@@ -305,7 +294,9 @@
     - name: Show foreman-installer stderr
       ansible.builtin.debug:
         var: foreman_installer_result.stderr_lines
-      when: foreman_installer_result.stderr is defined and (foreman_installer_result.stderr | length > 0)
+      when:
+        - foreman_installer_result.stderr is defined
+        - foreman_installer_result.stderr | length > 0
 
     - name: Re-check Katello answers file after installer run
       ansible.builtin.stat:
