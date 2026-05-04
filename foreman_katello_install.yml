@@ -56,6 +56,19 @@
       - "{{ foreman_server_ip }}"
       - "127.0.0.1"
 
+    # Satellite / Katello registration fallback
+    satellite_register_enabled: true
+    satellite_server_fqdn: "{{ survey_satellite_server_fqdn | default('foreman.lab.duncan-networks.com', true) }}"
+    satellite_username: "{{ survey_satellite_username | default('admin', true) }}"
+    satellite_password: "{{ survey_satellite_password | default('', true) }}"
+
+    satellite_server_url: "https://{{ satellite_server_fqdn }}/rhsm"
+    satellite_base_url: "https://{{ satellite_server_fqdn }}/pulp/content"
+
+    required_el9_repos:
+      - rhel-9-for-x86_64-baseos-rpms
+      - rhel-9-for-x86_64-appstream-rpms
+
   pre_tasks:
     - name: Fail if organization was not provided
       ansible.builtin.fail:
@@ -74,14 +87,88 @@
       register: enabled_repos
       changed_when: false
 
-    - name: Fail if BaseOS/AppStream repos are not available
+    - name: Determine whether required EL9 repos are missing
+      ansible.builtin.set_fact:
+        el9_content_repos_missing: >-
+          {{
+            ('baseos' not in (enabled_repos.stdout | lower)) or
+            ('appstream' not in (enabled_repos.stdout | lower))
+          }}
+
+    - name: Register host to Satellite when required EL9 repos are missing
+      when:
+        - el9_content_repos_missing
+        - satellite_register_enabled | bool
+      block:
+        - name: Fail if Satellite password was not provided
+          ansible.builtin.fail:
+            msg: "The survey variable 'survey_satellite_password' is required when Satellite registration is needed."
+          when: satellite_password | length == 0
+
+        - name: Install subscription-manager package if available
+          ansible.builtin.dnf:
+            name: subscription-manager
+            state: present
+          failed_when: false
+
+        - name: Clean existing subscription state
+          ansible.builtin.command: subscription-manager clean
+          changed_when: true
+          failed_when: false
+
+        - name: Register system to Satellite with username and password
+          ansible.builtin.command:
+            argv:
+              - subscription-manager
+              - register
+              - "--username={{ satellite_username }}"
+              - "--password={{ satellite_password }}"
+              - "--serverurl={{ satellite_server_url }}"
+              - "--baseurl={{ satellite_base_url }}"
+              - "--force"
+          register: satellite_register_result
+          changed_when: true
+          no_log: true
+
+        - name: Disable all repositories
+          community.general.rhsm_repository:
+            name: "*"
+            state: disabled
+
+        - name: Enable required RHEL 9 BaseOS/AppStream repositories
+          community.general.rhsm_repository:
+            name: "{{ required_el9_repos }}"
+            state: enabled
+
+        - name: Clean DNF metadata after Satellite registration
+          ansible.builtin.command: dnf clean all
+          changed_when: true
+
+        - name: Rebuild DNF cache after Satellite registration
+          ansible.builtin.command: dnf makecache
+          changed_when: true
+
+        - name: Re-check enabled repositories after Satellite registration
+          ansible.builtin.command: dnf repolist --enabled
+          register: enabled_repos_after_satellite
+          changed_when: false
+
+        - name: Update enabled repo check result
+          ansible.builtin.set_fact:
+            enabled_repos: "{{ enabled_repos_after_satellite }}"
+
+    - name: Fail if BaseOS/AppStream repos are still not available
       ansible.builtin.fail:
-        msg: >-
+        msg: |-
           This host does not have the required EL9 content repositories enabled.
           Foreman/Katello provisioning dependencies require RHEL BaseOS and AppStream.
+
+          Satellite registration attempted: {{ el9_content_repos_missing and satellite_register_enabled | bool }}
+
+          Enabled repositories:
+          {{ enabled_repos.stdout }}
       when:
-        - "'baseos' not in (enabled_repos.stdout | lower)"
-        - "'appstream' not in (enabled_repos.stdout | lower)"
+        - "'baseos' not in (enabled_repos.stdout | lower) or 'appstream' not in (enabled_repos.stdout | lower)"
 
     - name: Check whether the Foreman admin password file already exists
       ansible.builtin.stat:
