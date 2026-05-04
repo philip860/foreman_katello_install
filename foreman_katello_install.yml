@@ -58,8 +58,8 @@
 
     # Red Hat CDN registration fallback
     rhsm_register_enabled: true
-    rhsm_username: "{{ survey_rhsm_username | default('', true) }}"
-    rhsm_password: "{{ survey_rhsm_password | default('', true) }}"
+    rhsm_username: "{{ satellite_username_var | default('', true) }}"
+    rhsm_password: "{{ satellite_password_var | default('', true) }}"
 
     required_el9_repos:
       - rhel-9-for-x86_64-baseos-rpms
